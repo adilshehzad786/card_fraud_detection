@@ -1,6 +1,6 @@
 # Card testing detection lab
 
-I wanted to know whether a typical fraud model would catch card testing, so I built a small lab to find out. It didn't catch any of it.
+I wanted to know whether a typical fraud model would catch card testing, so I built a small lab to find out. The model missed every attempt. Counting cards in Splunk caught the loud attack completely, but only part of the quiet one.
 
 Card testing is when someone runs stolen cards through a checkout, as tiny payments or $0 card saves, to see which cards still work. Each attempt looks like a normal customer buying something small. You only see the attack when you start counting.
 
@@ -24,7 +24,7 @@ The model is fine at its own job. It was trained on classic fraud: big late-nigh
 
 90% of the attack attempts were approved, so the decline rule never fired.
 
-Counting cards per device caught the loud attack. The spread attack never put more than 2 attempts on one device in 5 minutes, so D1 missed all of it, and it flagged 24 real customers on a shared terminal.
+Counting cards per device caught the loud attack. The spread attack never put more than 2 attempts on one device in 5 minutes, so D1 missed all of it. D1 also flagged 24 real customers on a shared terminal.
 
 Counting across the whole checkout caught 52 of the 360 spread attempts. But on its own the attack never put more than 14 card saves and small payments into a window, and D2 needs 20. Every one of those detections happened because real customers were shopping at the same time. On a quieter day, the spread attack would have gone straight through.
 
