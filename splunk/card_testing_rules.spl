@@ -1,0 +1,49 @@
+/* Import card_testing_events.csv into an isolated index named card_testing_lab.
+   Set search time range to All time. All rule criteria below are recomputed;
+   imported Python flags are used only by the final parity check.
+   Fixed UTC bins; retrospective flagged-event coverage, not prevention latency.
+*/
+
+/* D1: per-device counts; all payment and card-save events, approvals included. */
+index=card_testing_lab event_source="synthetic_lab"
+| eval epoch=tonumber(epoch), bucket_epoch=floor(epoch/300)*300
+| stats count AS attempts dc(card_fp) AS cards count(eval(outcome="declined")) AS declines BY checkout_id device_fp bucket_epoch
+| eval decline_share=declines/attempts
+| where attempts>=20 AND cards>=15
+| eval bucket_display=strftime(bucket_epoch,"%Y-%m-%d %H:%M:%S")
+| table checkout_id device_fp bucket_epoch bucket_display attempts cards declines decline_share
+
+/* D2: candidate events only; low-value payments (USD cents) OR card saves. */
+index=card_testing_lab event_source="synthetic_lab"
+| eval epoch=tonumber(epoch), amount_minor=tonumber(amount_minor), bucket_epoch=floor(epoch/300)*300
+| where flow="setup_card" OR (flow="payment" AND currency="USD" AND amount_minor<=100)
+| stats count AS candidates dc(card_fp) AS cards BY checkout_id bucket_epoch
+| where candidates>=20 AND cards>=15
+| table checkout_id bucket_epoch candidates cards
+
+/* Full event-level parity check; all three mismatch totals must be zero.
+   Labels and scenarios are not used by the detection criteria. */
+index=card_testing_lab event_source="synthetic_lab"
+| eval epoch=tonumber(epoch), amount_minor=tonumber(amount_minor), bucket_epoch=floor(epoch/300)*300
+| eval candidate_spl=if(flow="setup_card" OR (flow="payment" AND currency="USD" AND amount_minor<=100),1,0)
+| eventstats count AS d_attempts dc(card_fp) AS d_cards count(eval(outcome="declined")) AS d_declines BY checkout_id device_fp bucket_epoch
+| eventstats sum(candidate_spl) AS c_attempts dc(eval(if(candidate_spl=1,card_fp,null()))) AS c_cards BY checkout_id bucket_epoch
+| eval device_spl=if(d_attempts>=20 AND d_cards>=15,1,0)
+| eval checkout_spl=if(candidate_spl=1 AND c_attempts>=20 AND c_cards>=15,1,0)
+| eval decline_spl=if(d_attempts>=20 AND d_cards>=15 AND d_declines/d_attempts>=0.8,1,0)
+| eval device_mismatch=if(device_spl=tonumber(device_rule),0,1), checkout_mismatch=if(checkout_spl=tonumber(checkout_rule),0,1), decline_mismatch=if(decline_spl=tonumber(decline_rule),0,1)
+| stats count AS ingested_events dc(event_id) AS unique_events sum(device_mismatch) AS device_mismatches sum(checkout_mismatch) AS checkout_mismatches sum(decline_mismatch) AS decline_mismatches
+
+/* Scenario coverage using recomputed flags. Labels/scenarios appear only here,
+   after the actual detection criteria, to measure known synthetic ground truth. */
+index=card_testing_lab event_source="synthetic_lab"
+| eval epoch=tonumber(epoch), amount_minor=tonumber(amount_minor), bucket_epoch=floor(epoch/300)*300
+| eval candidate_spl=if(flow="setup_card" OR (flow="payment" AND currency="USD" AND amount_minor<=100),1,0)
+| eventstats count AS d_attempts dc(card_fp) AS d_cards count(eval(outcome="declined")) AS d_declines BY checkout_id device_fp bucket_epoch
+| eventstats sum(candidate_spl) AS c_attempts dc(eval(if(candidate_spl=1,card_fp,null()))) AS c_cards BY checkout_id bucket_epoch
+| eval device_spl=if(d_attempts>=20 AND d_cards>=15,1,0), checkout_spl=if(candidate_spl=1 AND c_attempts>=20 AND c_cards>=15,1,0), decline_spl=if(d_attempts>=20 AND d_cards>=15 AND d_declines/d_attempts>=0.8,1,0)
+| stats count AS events sum(device_spl) AS device_flagged sum(checkout_spl) AS checkout_flagged sum(decline_spl) AS decline_flagged sum(toy_model) AS model_flagged sum(toy_model_scored) AS model_scored BY scenario
+| eval device_coverage=round(100*device_flagged/events,2), checkout_coverage=round(100*checkout_flagged/events,2)
+
+/* NOTE: strftime uses the Splunk user's display timezone. Set user Preferences
+   timezone to UTC if a UTC bucket_display is desired; bucket_epoch remains authoritative. */

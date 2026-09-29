@@ -1,0 +1,26 @@
+# Local Splunk for the card-testing lab. Start it with: python3 splunk/start_lab.py
+# Web (8000) and the management API (8089) listen on 127.0.0.1 only.
+name: card-testing-lab
+services:
+  splunk:
+    image: splunk/splunk:10.4.3
+    platform: linux/amd64  # x86-64 image; Apple Silicon runs it under emulation
+    container_name: card-testing-splunk
+    hostname: card-testing-splunk
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8089:8089"
+    environment:
+      SPLUNK_START_ARGS: --accept-license
+      SPLUNK_GENERAL_TERMS: --accept-sgt-current-at-splunk-com
+      SPLUNK_LICENSE_URI: Free
+      SPLUNK_PASSWORD: ${CARD_LAB_SPLUNK_PASSWORD:?start the lab with python3 splunk/start_lab.py, which creates .lab-state/splunk.env}
+    volumes:
+      - splunk-etc:/opt/splunk/etc
+      - splunk-var:/opt/splunk/var
+    mem_limit: 5g
+    cpus: 3
+    restart: "no"
+volumes:
+  splunk-etc:
+  splunk-var:

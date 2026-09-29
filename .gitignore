@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# Generated lab outputs (the baseline dataset lives in data/)
+lab_output*/
+variant_*/
+.mpl_cache/
+card_lab_requirements.txt
+*.zip
+
+# Local Splunk lab state: bootstrap password
+.lab-state/
+.env
+
+# OS and editor files
+.DS_Store
+.vscode/
+.idea/
