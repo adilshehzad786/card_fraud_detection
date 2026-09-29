@@ -11,6 +11,7 @@ services:
       - "127.0.0.1:8000:8000"
       - "127.0.0.1:8089:8089"
     environment:
+      # These two flags accept the Splunk license and the Splunk General Terms. Read them first (see README.md).
       SPLUNK_START_ARGS: --accept-license
       SPLUNK_GENERAL_TERMS: --accept-sgt-current-at-splunk-com
       SPLUNK_LICENSE_URI: Free

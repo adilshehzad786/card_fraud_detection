@@ -21,13 +21,13 @@ The baseline run (seed 61027) has 1,972 events between 10:00 and 14:00 UTC on 26
 - **A model can score well and still miss this.** On held-out classic fraud (large, late-night, far-from-home purchases) the model reaches 84.2% recall and 95.3% precision. The card-testing payments all scored below 0.001, against its 0.48 threshold. It scores payments only, so the attacks' 160 card saves were never scored.
 - **Declines weren't the signal.** 90% of attack attempts were approved, so the decline-gated rule saw nothing.
 - **Spreading out defeats per-device limits.** The spread attack never put more than 2 attempts on one device in a 5-minute window.
-- **The checkout-wide rule needed help.** On its own, the spread attack never produced more than 14 candidate events in a window, below the threshold of 20. All 52 detections came from windows where genuine customers pushed the total over 20.
+- **The checkout-wide rule needed help.** On its own, the spread attack never produced more than 14 candidate events in a window, below the threshold of 20. All 52 detections came from windows where genuine customers pushed the total to 20 or more.
 
 The [lab guide](docs/LAB_GUIDE.md#how-splunk-detected-each-attack) walks through each Splunk result window by window.
 
 ## Quick start
 
-You need Docker Desktop with 3 CPUs, 5 GB of memory and about 6 GB of free disk space for the Splunk container. From the repository root:
+You need Docker Desktop with 3 CPUs, 5 GB of memory and about 6 GB of free disk space for the Splunk container. `start_lab.py` accepts the Splunk license and the [Splunk General Terms](https://www.splunk.com/en_us/legal/splunk-general-terms.html) on your behalf, so read them before you run it. From the repository root:
 
 ```bash
 python3 splunk/start_lab.py     # start Splunk and load data/card_testing_events.csv
@@ -39,7 +39,7 @@ Then open <http://127.0.0.1:8000>, set the time range to **All time**, and follo
 ### Regenerate the events
 
 - **Google Colab:** upload `card_testing_lab.ipynb`, then choose Runtime → Run all. The last cell packages the outputs as a ZIP.
-- **Locally**, with Python 3.12 or later:
+- **Locally**, with Python 3.12 or 3.13:
 
   ```bash
   python3 -m venv .venv && source .venv/bin/activate

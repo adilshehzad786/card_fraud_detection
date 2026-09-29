@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import secrets
 import shlex
 import subprocess
@@ -91,7 +91,7 @@ def copy_into_app(files: dict[str, Path]) -> None:
     """Copy files into the Splunk app as one tar stream, then hand them to the splunk user."""
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode='w') as tar:
-        for folder in sorted({str(Path(name).parent) for name in files} - {'.'}):
+        for folder in sorted({str(PurePosixPath(name).parent) for name in files} - {'.'}):
             info = tarfile.TarInfo(folder)
             info.type, info.mode = tarfile.DIRTYPE, 0o755
             tar.addfile(info)
@@ -135,7 +135,8 @@ def main() -> None:
         raise SystemExit('docker compose failed. Is Docker Desktop running?')
     wait_until_healthy()
 
-    configs = {str(path.relative_to(APP_DIR)): path for path in sorted(APP_DIR.rglob('*.conf'))}
+    # POSIX names, whatever the host OS: they become paths inside the Linux container.
+    configs = {path.relative_to(APP_DIR).as_posix(): path for path in sorted(APP_DIR.rglob('*.conf'))}
     present = hashes_in_container([*configs, CSV_IN_APP])
     if CSV_IN_APP in present and present[CSV_IN_APP] != sha256(csv_path):
         raise SystemExit('This lab already holds a different events CSV. Mixing datasets would corrupt every count.\n'

@@ -24,7 +24,7 @@ The events come from one invented shop, `shop_demo`, between 10:00 and 14:00 UTC
 
 | Scenario | Events | What it represents |
 | --- | --- | --- |
-| `legitimate_baseline` | 1,440 | Ordinary customers, each with their own card and device. 8% are card saves and 4% are declined. |
+| `legitimate_baseline` | 1,440 | Ordinary customers, each with their own card and device. About 7% are card saves and 4% are declined. |
 | `legitimate_shared_device` | 24 | A genuine shared terminal: 24 customers pay on one device within 5 minutes (12:15). |
 | `legitimate_setup_burst` | 28 | A genuine onboarding rush: 28 customers save a card within 5 minutes (13:30). |
 | `loud` | 120 | Card testing from **one device**: one attempt every 10 seconds for 20 minutes (10:30–10:50). |
@@ -51,7 +51,7 @@ The repository already contains the baseline events, `data/card_testing_events.c
 
 **Google Colab.** Upload `card_testing_lab.ipynb` to [Colab](https://colab.research.google.com/) and choose Runtime → Run all (a CPU runtime is enough). The last cell packages the outputs as a ZIP. Set `DOWNLOAD_IN_COLAB = True` and rerun that cell, or download the ZIP from the Files panel. Colab runs on Google's servers, which can't reach Splunk on your computer, so download the CSV before loading it.
 
-**Locally**, with Python 3.12 or later:
+**Locally**, with Python 3.12 or 3.13:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -82,6 +82,8 @@ The launcher does three things:
 1. It runs Splunk 10.4.3 under the Free license in a container named `card-testing-splunk`, listening only on 127.0.0.1.
 2. It installs a small Splunk app that creates `index=card_testing_lab`, parses the CSV and takes each event's `_time` from the `epoch` column.
 3. It copies the CSV in once, then restarts Splunk to index it.
+
+Running it accepts the Splunk license and the [Splunk General Terms](https://www.splunk.com/en_us/legal/splunk-general-terms.html) on your behalf, so read them first.
 
 On Apple Silicon, where the x86-64 image runs under emulation, the first start takes 3–5 minutes and loading the data takes about 3 more. Lines like `still starting (2 min)...` are normal. Rerunning the launcher is safe: it never loads the same data twice, and it refuses a different CSV rather than mixing two datasets in one index.
 
@@ -218,7 +220,7 @@ In the attack rows, the flag counts are coverage. In the `legitimate_*` rows, th
 | D0: decline-gated | 0 of 120 | Only 10% of attempts were declined, and D0 needs 80%. |
 | Transaction model | 0 of 80 payments | Payments of $0.11–$0.99 at 10:30 UTC, close to home and with no card history. Every one scored below 0.001, against a threshold of 0.48. |
 
-Any rule that counts cards per device catches this attack. Only a decline-based trigger misses it, because most of the tested cards worked.
+Any rule that counts cards per device catches this attack. A decline-based trigger misses it too, because most of the tested cards worked.
 
 ### Spread attack: 80 devices, 360 attempts over 3 hours
 
@@ -239,7 +241,7 @@ So D2's 52 spread detections are 14 + 13 + 13 + 12 attempts from four windows, a
 ### What the false positives show
 
 - **D1's 24:** a shared terminal, such as a store kiosk or call-centre device, legitimately puts many cards on one device.
-- **D2's 67:** the 28 onboarding card saves, plus 39 genuine customers who happened to be shopping during an attack window. A window-level rule flags everyone in the window, including real customers.
+- **D2's 67:** the 28 onboarding card saves, plus 39 genuine card saves and payments of $1 or less (20 and 19) that happened to land in a flagged window. D2 flags every candidate in a flagged window, real customers included.
 
 No single rule here catches both attacks without false positives. That is the point of the lab: measure what each detector can actually see, then combine signals and investigate before you block. Useful signals include card saves as well as payments, approvals as well as declines, and cards per device as well as cards across the checkout.
 
