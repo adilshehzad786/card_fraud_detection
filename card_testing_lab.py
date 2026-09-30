@@ -30,6 +30,26 @@ DETECTORS = ["toy_model", "device_rule", "checkout_rule", "decline_rule"]
 SCENARIOS = ["legitimate_baseline", "legitimate_shared_device", "legitimate_setup_burst", "loud", "spread"]
 BASE = int(pd.Timestamp("2026-09-26T10:00:00Z").timestamp())
 
+# Counting-rule criteria, shared by apply_detectors() and reference_rule_flags() so the
+# two Python implementations cannot drift apart. The SPL in splunk/ mirrors them by design.
+WINDOW_SECONDS = 300
+RULE_MIN_EVENTS = 20
+RULE_MIN_CARDS = 15
+RULE_MIN_DECLINE_SHARE = .8
+SMALL_PAYMENT_MAX_MINOR = 100
+
+
+def classic_population(rng: np.random.Generator, n: int, amount_loc: float, amount_scale: float,
+                       hour_weights: list[int], distance_scale: float, prior_rate: float, label: int) -> pd.DataFrame:
+    """One synthetic transaction population; the parameter gap is the classic-fraud assumption."""
+    return pd.DataFrame({
+        "amount_minor": np.clip(rng.lognormal(amount_loc, amount_scale, n), 10, 300000).round(),
+        "hour_utc": rng.choice(np.arange(24), n, p=np.array(hour_weights) / sum(hour_weights)),
+        "distance_km": rng.exponential(distance_scale, n),
+        "prior_card_attempts_1h": rng.poisson(prior_rate, n),
+        "label": label,
+    })
+
 
 def classic_data(seed: int) -> pd.DataFrame:
     """Intentionally simplified, overlapping synthetic transaction populations.
@@ -38,21 +58,8 @@ def classic_data(seed: int) -> pd.DataFrame:
     benchmark. No trained model chooses how evaluation card-testing data is made.
     """
     rng = np.random.default_rng(seed)
-    n, f = 12000, 600
-    benign = pd.DataFrame({
-        "amount_minor": np.clip(rng.lognormal(7.7, 1.15, n), 10, 300000).round(),
-        "hour_utc": rng.choice(np.arange(24), n, p=np.array([1]*6 + [3]*3 + [8]*12 + [3]*3)/120),
-        "distance_km": rng.exponential(35, n),
-        "prior_card_attempts_1h": rng.poisson(.7, n),
-        "label": 0,
-    })
-    fraud = pd.DataFrame({
-        "amount_minor": np.clip(rng.lognormal(10.4, .85, f), 10, 300000).round(),
-        "hour_utc": rng.choice(np.arange(24), f, p=np.array([12]*6 + [2]*18)/108),
-        "distance_km": rng.exponential(300, f),
-        "prior_card_attempts_1h": rng.poisson(3.0, f),
-        "label": 1,
-    })
+    benign = classic_population(rng, 12000, 7.7, 1.15, [1]*6 + [3]*3 + [8]*12 + [3]*3, 35, .7, 0)
+    fraud = classic_population(rng, 600, 10.4, .85, [12]*6 + [2]*18, 300, 3.0, 1)
     df = pd.concat([benign, fraud], ignore_index=True)
     df.insert(0, "sample_id", [f"classic_{i:06d}" for i in range(len(df))])
     return df
@@ -142,9 +149,10 @@ def generate_events(seed: int, spread_devices: int = 80) -> pd.DataFrame:
 
     df = pd.DataFrame(records).sort_values(["epoch", "card_fp"], kind="stable").reset_index(drop=True)
     df.insert(0, "event_id", [f"evt_{i:06d}" for i in range(len(df))])
-    df.insert(1, "ts", pd.to_datetime(df.epoch, unit="s", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
-    df["hour_utc"] = pd.to_datetime(df.epoch, unit="s", utc=True).dt.hour
-    df["bucket_epoch"] = (df.epoch // 300) * 300
+    timestamps = pd.to_datetime(df.epoch, unit="s", utc=True)
+    df.insert(1, "ts", timestamps.dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    df["hour_utc"] = timestamps.dt.hour
+    df["bucket_epoch"] = (df.epoch // WINDOW_SECONDS) * WINDOW_SECONDS
     assert df.event_id.is_unique and df.card_fp.is_unique
     assert df.epoch.between(BASE, BASE + 14400 - 1).all()
     assert (pd.to_datetime(df.ts, utc=True).astype("int64") // 10**9 == df.epoch).all()
@@ -163,16 +171,17 @@ def apply_detectors(df, model, threshold):
     df["device_attempts"] = device_group.event_id.transform("size")
     df["device_cards"] = device_group.card_fp.transform("nunique")
     df["device_declines"] = device_group.outcome.transform(lambda s: (s == "declined").sum())
-    df["device_rule"] = ((df.device_attempts >= 20) & (df.device_cards >= 15)).astype(int)
-    df["decline_rule"] = ((df.device_attempts >= 20) & (df.device_cards >= 15)
-                          & (df.device_declines / df.device_attempts >= .8)).astype(int)
+    df["device_rule"] = ((df.device_attempts >= RULE_MIN_EVENTS) & (df.device_cards >= RULE_MIN_CARDS)).astype(int)
+    df["decline_rule"] = ((df.device_attempts >= RULE_MIN_EVENTS) & (df.device_cards >= RULE_MIN_CARDS)
+                          & (df.device_declines / df.device_attempts >= RULE_MIN_DECLINE_SHARE)).astype(int)
     df["candidate"] = ((df.flow == "setup_card") | ((df.flow == "payment") & (df.currency == "USD")
-                                                   & (df.amount_minor <= 100))).astype(int)
+                                                   & (df.amount_minor <= SMALL_PAYMENT_MAX_MINOR))).astype(int)
     selected = df.loc[df.candidate == 1].groupby(["checkout_id", "bucket_epoch"], sort=True)
     counts = selected.agg(checkout_candidates=("event_id", "size"), checkout_cards=("card_fp", "nunique"))
     df = df.join(counts, on=["checkout_id", "bucket_epoch"])
     df[["checkout_candidates", "checkout_cards"]] = df[["checkout_candidates", "checkout_cards"]].fillna(0).astype(int)
-    df["checkout_rule"] = ((df.candidate == 1) & (df.checkout_candidates >= 20) & (df.checkout_cards >= 15)).astype(int)
+    df["checkout_rule"] = ((df.candidate == 1) & (df.checkout_candidates >= RULE_MIN_EVENTS)
+                           & (df.checkout_cards >= RULE_MIN_CARDS)).astype(int)
     return df
 
 
@@ -180,20 +189,21 @@ def reference_rule_flags(df):
     """Independent plain-Python aggregation mirrors SPL; checks pandas implementation."""
     dev, shop = {}, {}
     for r in df.to_dict("records"):
-        bucket = int(r["epoch"]) // 300 * 300
+        bucket = int(r["epoch"]) // WINDOW_SECONDS * WINDOW_SECONDS
         key = (r["checkout_id"], r["device_fp"], bucket)
         dev.setdefault(key, []).append(r)
-        candidate = r["flow"] == "setup_card" or (r["flow"] == "payment" and r["currency"] == "USD" and r["amount_minor"] <= 100)
+        candidate = (r["flow"] == "setup_card" or (r["flow"] == "payment" and r["currency"] == "USD"
+                                                   and r["amount_minor"] <= SMALL_PAYMENT_MAX_MINOR))
         if candidate:
             shop.setdefault((r["checkout_id"], bucket), []).append(r)
     expected = {k: set() for k in ["device_rule", "checkout_rule", "decline_rule"]}
     for rows in dev.values():
-        if len(rows) >= 20 and len({r["card_fp"] for r in rows}) >= 15:
+        if len(rows) >= RULE_MIN_EVENTS and len({r["card_fp"] for r in rows}) >= RULE_MIN_CARDS:
             expected["device_rule"].update(r["event_id"] for r in rows)
-            if sum(r["outcome"] == "declined" for r in rows) / len(rows) >= .8:
+            if sum(r["outcome"] == "declined" for r in rows) / len(rows) >= RULE_MIN_DECLINE_SHARE:
                 expected["decline_rule"].update(r["event_id"] for r in rows)
     for rows in shop.values():
-        if len(rows) >= 20 and len({r["card_fp"] for r in rows}) >= 15:
+        if len(rows) >= RULE_MIN_EVENTS and len({r["card_fp"] for r in rows}) >= RULE_MIN_CARDS:
             expected["checkout_rule"].update(r["event_id"] for r in rows)
     for rule, ids in expected.items():
         assert ids == set(df.loc[df[rule] == 1, "event_id"]), f"Independent rule mismatch: {rule}"
@@ -203,17 +213,19 @@ def summarize(df):
     rows = []
     for scenario in SCENARIOS:
         subset = df[df.scenario == scenario]
+        payments, setups = subset.flow == "payment", subset.flow == "setup_card"
         for detector in DETECTORS:
             flagged = subset[subset[detector] == 1]
+            flagged_payments, flagged_setups = flagged.flow == "payment", flagged.flow == "setup_card"
             keys = ["checkout_id", "bucket_epoch"] + (["device_fp"] if detector in ("device_rule", "decline_rule") else [])
             rows.append({"scenario": scenario, "detector": detector, "events": len(subset),
                          "flagged_events": len(flagged), "coverage": len(flagged) / len(subset),
                          "flagged_group_intersections": len(flagged[keys].drop_duplicates()),
-                         "payment_events": int((subset.flow == "payment").sum()),
-                         "setup_events": int((subset.flow == "setup_card").sum()),
-                         "flagged_payment_events": int((flagged.flow == "payment").sum()),
-                         "flagged_setup_events": int((flagged.flow == "setup_card").sum()),
-                         "payment_coverage": int((flagged.flow == "payment").sum()) / int((subset.flow == "payment").sum()) if (subset.flow == "payment").any() else None,
+                         "payment_events": int(payments.sum()),
+                         "setup_events": int(setups.sum()),
+                         "flagged_payment_events": int(flagged_payments.sum()),
+                         "flagged_setup_events": int(flagged_setups.sum()),
+                         "payment_coverage": int(flagged_payments.sum()) / int(payments.sum()) if payments.any() else None,
                          "model_unscored_events": int((subset.toy_model_scored == 0).sum()) if detector == "toy_model" else 0})
     return pd.DataFrame(rows)
 
@@ -259,6 +271,21 @@ def draw_chart(path, summary, classic):
     plt.close(fig)
 
 
+def build_metrics(args: argparse.Namespace, events: pd.DataFrame, csv_text: str, classic: dict,
+                  summary: pd.DataFrame) -> dict:
+    benign = events.label == 0
+    return {"seed": args.seed, "spread_devices": args.spread_devices, "event_count": len(events),
+            "event_sha256": hashlib.sha256(csv_text.encode()).hexdigest(), "classic_test": classic,
+            "synthetic_limitations": "Generators encode assumptions. No real fraud benchmark, generalization, production detection, or prevention claims.",
+            "coverage_definition": "Flagged events / scenario events. Fixed UTC five-minute bins, assigned retrospectively. Model scores payments only; unscored setups are uncovered.",
+            "currency_and_units": "USD integer minor units; small payment means <=100 cents ($1).",
+            "benign_false_positives": {d: int(events.loc[benign, d].sum()) for d in DETECTORS},
+            "benign_event_count": int(benign.sum()),
+            "versions": {"numpy": np.__version__, "pandas": pd.__version__, "sklearn": sklearn.__version__, "matplotlib": matplotlib.__version__},
+            "scenarios": json.loads(summary.to_json(orient="records")),
+            "self_checks": ["unique invented event IDs and card identifiers", "timestamps round-trip in UTC", "disjoint stratified training/validation/test sample IDs", "no label/scenario/ID in features", "repeat generation identical", "independent rule aggregation agrees"]}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output-dir", "--outdir", dest="output_dir", default="lab_output")
@@ -272,21 +299,11 @@ def main():
     events = apply_detectors(events, model, threshold)
     reference_rule_flags(events)
     summary = summarize(events)
-    csv = events.to_csv(index=False, float_format="%.10f")
-    (out / "card_testing_events.csv").write_text(csv)
+    csv_text = events.to_csv(index=False, float_format="%.10f")
+    (out / "card_testing_events.csv").write_text(csv_text)
     summary.to_csv(out / "card_testing_metrics.csv", index=False, float_format="%.10f")
     splits.to_csv(out / "classic_split_manifest.csv", index=False)
-    benign = events.label == 0
-    metrics = {"seed": args.seed, "spread_devices": args.spread_devices, "event_count": len(events),
-               "event_sha256": hashlib.sha256(csv.encode()).hexdigest(), "classic_test": classic,
-               "synthetic_limitations": "Generators encode assumptions. No real fraud benchmark, generalization, production detection, or prevention claims.",
-               "coverage_definition": "Flagged events / scenario events. Fixed UTC five-minute bins, assigned retrospectively. Model scores payments only; unscored setups are uncovered.",
-               "currency_and_units": "USD integer minor units; small payment means <=100 cents ($1).",
-               "benign_false_positives": {d: int(events.loc[benign, d].sum()) for d in DETECTORS},
-               "benign_event_count": int(benign.sum()),
-               "versions": {"numpy": np.__version__, "pandas": pd.__version__, "sklearn": sklearn.__version__, "matplotlib": matplotlib.__version__},
-               "scenarios": json.loads(summary.to_json(orient="records")),
-               "self_checks": ["unique invented event IDs and card identifiers", "timestamps round-trip in UTC", "disjoint stratified training/validation/test sample IDs", "no label/scenario/ID in features", "repeat generation identical", "independent rule aggregation agrees"]}
+    metrics = build_metrics(args, events, csv_text, classic, summary)
     (out / "card_testing_metrics.json").write_text(json.dumps(metrics, indent=2, allow_nan=False) + "\n")
     # The official chart is for the default 80-device baseline. Avoid mislabeling a variant.
     if args.spread_devices == 80:
