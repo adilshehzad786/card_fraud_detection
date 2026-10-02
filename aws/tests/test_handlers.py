@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import types
 import unittest
 import urllib.error
@@ -23,11 +24,11 @@ ZIPFILE_LIMIT = 4096  # CloudFormation's limit for inline Lambda code
 API_URL = "https://abc123.execute-api.us-east-1.amazonaws.com/demo"
 
 
-def inline_code(logical_id):
-    """Return the ZipFile block of a function resource, dedented."""
+def yaml_block(marker, after=""):
+    """Return the literal block scalar that follows `marker` in the template, dedented."""
     text = TEMPLATE.read_text()
-    start = text.index(f"\n  {logical_id}:\n")
-    block = text.index("ZipFile: |", start)
+    start = text.index(after) if after else 0
+    block = text.index(marker, start)
     lines = text[block:].split("\n")[1:]
     indent = len(lines[0]) - len(lines[0].lstrip())
     out = []
@@ -39,6 +40,19 @@ def inline_code(logical_id):
         else:
             out.append(line[indent:])
     return "\n".join(out).rstrip() + "\n"
+
+
+def inline_code(logical_id):
+    """Return the ZipFile block of a function resource, dedented."""
+    return yaml_block("ZipFile: |", after=f"\n  {logical_id}:\n")
+
+
+def mapped_queries():
+    """The two Logs Insights queries from the template's Mappings section."""
+    text = TEMPLATE.read_text()
+    per_device = re.search(r'PerDevice:\n\s+Text: "(.*)"\n', text).group(1)
+    checkout_wide = re.search(r"CheckoutWide:\n\s+Text: '(.*)'\n", text).group(1)
+    return per_device, checkout_wide
 
 
 def load(logical_id, env):
@@ -88,6 +102,26 @@ class TemplateLimits(unittest.TestCase):
     def test_metric_filter_pattern_is_the_documented_one(self):
         text = TEMPLATE.read_text()
         self.assertIn('FilterPattern: \'{ ($.flow = "save_card") || ($.amount_minor <= 100) }\'', text)
+
+    def test_checkout_wide_query_counts_what_the_metric_filter_counts(self):
+        per_device, checkout_wide = mapped_queries()
+        self.assertIn('(flow = "save_card" or amount_minor <= 100)', checkout_wide)
+        self.assertIn("by device_fp, bin(5m)", per_device)
+        self.assertIn("by bin(5m)", checkout_wide)
+
+    def test_dashboard_body_is_valid_json_and_repeats_the_saved_queries(self):
+        body = re.sub(r"\$\{[^}]+\}", "X", yaml_block("DashboardBody: !Sub |"))
+        widgets = json.loads(body)["widgets"]
+        self.assertEqual(Counter(w["type"] for w in widgets), {"log": 2, "alarm": 1, "metric": 1})
+        for w in widgets:
+            self.assertTrue(0 <= w["x"] and w["x"] + w["width"] <= 24, "dashboard grid is 24 wide")
+            self.assertEqual(w["properties"].get("region", "X"), "X")
+        per_device, checkout_wide = mapped_queries()
+        log_queries = [w["properties"]["query"] for w in widgets if w["type"] == "log"]
+        self.assertEqual(log_queries, [f"SOURCE 'X' | {per_device}", f"SOURCE 'X' | {checkout_wide}"])
+        metric = next(w for w in widgets if w["type"] == "metric")
+        self.assertEqual(metric["properties"]["period"], 300)
+        self.assertEqual(metric["properties"]["annotations"]["horizontal"][0]["value"], 20)
 
 
 class CheckoutHandler(unittest.TestCase):

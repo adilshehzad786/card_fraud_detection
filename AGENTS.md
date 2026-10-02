@@ -52,11 +52,11 @@ tools/
 aws/
   AGENTS.md               context and rules for the AWS lab; read first
   probe-watch.yaml        one CloudFormation stack: API Gateway, WAF, two inline Lambdas,
-                          metric filter, alarm, SNS (cfn-lint clean, not yet deployed)
-  probe-watch-runbook.md  deploy, demo script, teardown, first-run notes
+                          metric filter, alarm, SNS, saved queries, dashboard
+                          (cfn-lint clean, not yet deployed)
+  probe-watch-runbook.md  console-only deploy, demo script, teardown, first-run notes
   README.md               what the AWS lab shows and the three-step demo
-  scripts/                CloudShell helpers: deploy, demo, results, teardown (AWS CLI only)
-  tests/                  stdlib unittest for the inline handlers
+  tests/                  stdlib unittest for the inline handlers and the dashboard body
 .lab-state/               gitignored; holds the container's bootstrap password (splunk.env)
 ```
 

@@ -33,8 +33,8 @@ decline-gated rule caught nothing because 90% of attempts were approved.
   - Everything is wiped after the session. One CloudFormation file, console upload,
     under 5 min.
   - Lambda: max 10 functions, 2048 MB. We use 2.
-  - Allowed and used: CloudFormation, API Gateway, Lambda, WAF, CloudWatch, SNS, IAM,
-    CloudShell.
+  - Allowed and used: CloudFormation, API Gateway, Lambda, WAF, CloudWatch, SNS, IAM.
+    CloudShell is allowed but not used; the demo runs from the console.
   - Not supported: PrivateLink (so no VPC endpoints, so no VPC at all), OpenSearch
     Serverless, Cloud9, CodeCommit, Amazon Fraud Detector.
   - Abuse monitoring is on. Keep traffic to hundreds of requests, not thousands. The
@@ -64,10 +64,17 @@ decline-gated rule caught nothing because 90% of attempts were approved.
   `ProbeWatch/ProbeShapedAttempts`. Alarm: Sum > 20 over 300 s, missing data not
   breaching, to an SNS topic with an email subscription (`AlertEmail`, must be confirmed).
 - Both log groups are stack resources, so deleting the stack leaves nothing behind.
+- Console pieces, all CloudWatch: the two queries saved as `AWS::Logs::QueryDefinition`
+  (`<stack>/per-device`, `<stack>/checkout-wide`) and one `AWS::CloudWatch::Dashboard`
+  named after the stack: both query tables, the alarm widget, and a graph of
+  probe-shaped attempts plus the WAF rule's counted and blocked requests.
 - Outputs: `ApiUrl`, `EventsLogGroup`, `SimulatorFunction`, `WafMode`, `AlarmName`,
-  `PerDeviceQuery`, `CheckoutWideQuery`.
+  `PerDeviceQuery`, `CheckoutWideQuery`, and console links `DashboardUrl`,
+  `SimulatorTestUrl`, `AlarmUrl`, `WebAclUrl`.
 
-Logs Insights queries used in the demo (also in the outputs):
+Logs Insights queries used in the demo (kept once in `Mappings`, used by the saved
+queries and the outputs; the dashboard repeats them with JSON escaping and a test checks
+the copies match):
 
 ```
 filter ispresent(flow)
@@ -85,38 +92,35 @@ filter ispresent(flow) and (flow = "save_card" or amount_minor <= 100)
 - `probe-watch.yaml`: the stack. cfn-lint clean. Both handlers unit-tested with the HTTP
   call stubbed (`python3 -m unittest discover -s tests`). **Not yet deployed to a real
   AWS account.** Expect first-run fixes; the runbook lists the likely spots.
-- `probe-watch-runbook.md`: deploy steps, demo script, teardown, why the design fits the
-  sandbox, first-run notes.
-- `scripts/deploy.sh`, `scripts/demo.sh`, `scripts/results.sh`, `scripts/teardown.sh`:
-  CloudShell helpers, AWS CLI only (plus python3 for pretty-printing, present in
-  CloudShell). Stack name from `STACK_NAME`, default `probe-watch`.
+- `probe-watch-runbook.md`: console-only deploy steps, demo script, teardown, why the
+  design fits the sandbox, first-run notes.
 - `tests/test_handlers.py`: stdlib unit tests; they extract the inline code from the
-  template so there is one copy of it.
+  template so there is one copy of it, and check the dashboard body is valid JSON that
+  repeats the saved queries.
 - Slides live in a Claude artifact (14 slides). Slides 6 and 11 match this lab (API
   Gateway + WAF to Lambda; Logs Insights).
 
-## Demo script
+## Demo script (AWS console only, no shell)
 
-Phase 1, `WafMode=COUNT`: deploy, confirm the SNS email, run `normal`, `loud`, `spread`.
-Show the per-device query (loud caught, spread not), the checkout-wide query (both), and
-the alarm email. Point: every request got HTTP 200. The outcome fields showed the attack,
-not the status code.
+Phase 1, `WafMode=COUNT`: upload the template in the CloudFormation console, confirm the
+SNS email, open the Outputs links. In the Lambda console Test tab run `{"scenario":
+"normal"}`, then `"loud"`, then `"spread"` and read the histogram in Execution result.
+On the dashboard show the per-device table (loud caught, spread not), the checkout-wide
+table (both), the alarm widget, and the alarm email. Point: every request got HTTP 200.
+The outcome fields showed the attack, not the status code.
 
-Phase 2, update stack to `WafMode=BLOCK`: rerun `loud`, expect 403s after about 20
-requests (run it twice if WAF has not caught up). Rerun `spread`, still all 200. Point: the
-edge rate limit is worth having and does not cover the spread-out attack. Layers.
+Phase 2, Update stack in the console with `WafMode=BLOCK`: rerun `loud`, expect 403s after
+about 20 requests (run it twice if WAF has not caught up). Rerun `spread`, still all 200.
+Point: the edge rate limit is worth having and does not cover the spread-out attack. Layers.
 
-Invoke from CloudShell:
-```bash
-aws lambda invoke --function-name probe-watch-simulate --cli-binary-format raw-in-base64-out \
-  --cli-read-timeout 0 --payload '{"scenario":"loud"}' /tmp/out.json && cat /tmp/out.json
-```
+The user runs the demo from the AWS console: CloudFormation upload, Lambda Test tab,
+CloudWatch dashboard. Do not add shell scripts or CLI steps to the docs.
 
 ## Backlog, in order
 
 1. First real deploy in a sandbox. Fix any runtime errors (likely spots: WAF association
-   ARN, Lambda `LoggingConfig`, API Gateway deployment ordering). Record the outputs and
-   the real histograms in the runbook.
+   ARN, Lambda `LoggingConfig`, API Gateway deployment ordering, dashboard body). Record
+   the outputs and the real histograms in the runbook.
 2. Optional: Terraform port under `terraform/`, same resources, same constraints.
 
 Do not add resources outside the allowed list above. Do not add a VPC.
@@ -131,8 +135,10 @@ Do not add resources outside the allowed list above. Do not add a VPC.
   window; alarm goes to ALARM within about 5 minutes; email arrives.
 - `spread`: no device crosses the per-device threshold; checkout-wide query shows windows
   over 20.
+- The dashboard renders all four widgets and the saved queries appear in Logs Insights.
 - `WafMode=BLOCK`: `loud` returns 403 after about 20 requests; `spread` stays all 200.
-- Deleting the stack leaves nothing behind (`scripts/teardown.sh` checks).
+- Deleting the stack leaves nothing behind: no log group, function, web ACL, dashboard,
+  alarm or topic with the stack's name.
 
 ## Conventions
 

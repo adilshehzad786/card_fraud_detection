@@ -78,14 +78,14 @@ docs/
   images/
 aws/
   probe-watch.yaml          the same lab live on AWS: API Gateway + WAF, a fake checkout on Lambda
-  probe-watch-runbook.md    deploy, demo and teardown inside a 4-hour sandbox
-  scripts/                  CloudShell helpers (AWS CLI only)
+  probe-watch-runbook.md    deploy, demo and teardown from the AWS console inside a 4-hour sandbox
 ```
 
-The `aws/` folder is the live version of this lab for the talk: one CloudFormation stack,
-a traffic simulator that can only call its own API, and the per-device and checkout-wide
-counts as CloudWatch Logs Insights queries plus an alarm. Still synthetic, still no card
-numbers. See [aws/README.md](aws/README.md).
+The `aws/` folder is the live version of this lab for the talk, run entirely from the AWS
+console: one CloudFormation stack you upload, a traffic simulator you run from the Lambda
+console that can only call its own API, and a CloudWatch dashboard with the per-device and
+checkout-wide counts plus an alarm. Still synthetic, still no card numbers. See
+[aws/README.md](aws/README.md).
 
 ## Caveats
 

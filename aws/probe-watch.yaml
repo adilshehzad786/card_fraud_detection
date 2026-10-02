@@ -31,6 +31,15 @@ Parameters:
     MaxValue: 2000000000
     Description: Requests per 5 minutes from one x-device-fp header before the WAF rule acts.
 
+Mappings:
+  # The two Logs Insights queries, kept once. The dashboard body below repeats them
+  # with JSON escaping; tests/test_handlers.py checks the copies stay identical.
+  Queries:
+    PerDevice:
+      Text: "filter ispresent(flow) | stats count(*) as attempts, count_distinct(card_fp) as cards by device_fp, bin(5m) | sort attempts desc | limit 20"
+    CheckoutWide:
+      Text: 'filter ispresent(flow) and (flow = "save_card" or amount_minor <= 100) | stats count(*) as candidates, count_distinct(card_fp) as cards by bin(5m) | sort candidates desc | limit 20'
+
 Conditions:
   Blocking: !Equals [!Ref WafMode, BLOCK]
 
@@ -297,6 +306,71 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref AlertTopic]
 
+  # ---- Console: the two queries saved in Logs Insights, and one dashboard page
+  #      that shows everything the demo talks about.
+  PerDeviceSavedQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${AWS::StackName}/per-device"
+      LogGroupNames: [!Ref CheckoutEventsLogGroup]
+      QueryString: !FindInMap [Queries, PerDevice, Text]
+
+  CheckoutWideSavedQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub "${AWS::StackName}/checkout-wide"
+      LogGroupNames: [!Ref CheckoutEventsLogGroup]
+      QueryString: !FindInMap [Queries, CheckoutWide, Text]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref AWS::StackName
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "log", "x": 0, "y": 0, "width": 12, "height": 8,
+              "properties": {
+                "title": "Per device: attempts and distinct cards per 5-minute window",
+                "region": "${AWS::Region}",
+                "view": "table",
+                "query": "SOURCE '${CheckoutEventsLogGroup}' | filter ispresent(flow) | stats count(*) as attempts, count_distinct(card_fp) as cards by device_fp, bin(5m) | sort attempts desc | limit 20"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 0, "width": 12, "height": 8,
+              "properties": {
+                "title": "Checkout-wide: probe-shaped attempts per 5-minute window",
+                "region": "${AWS::Region}",
+                "view": "table",
+                "query": "SOURCE '${CheckoutEventsLogGroup}' | filter ispresent(flow) and (flow = \"save_card\" or amount_minor <= 100) | stats count(*) as candidates, count_distinct(card_fp) as cards by bin(5m) | sort candidates desc | limit 20"
+              }
+            },
+            {
+              "type": "alarm", "x": 0, "y": 8, "width": 6, "height": 6,
+              "properties": {
+                "title": "Checkout-wide alarm",
+                "alarms": ["${CheckoutWideAlarm.Arn}"]
+              }
+            },
+            {
+              "type": "metric", "x": 6, "y": 8, "width": 18, "height": 6,
+              "properties": {
+                "title": "Per 5 minutes: probe-shaped attempts, and what the WAF rule counted or blocked",
+                "region": "${AWS::Region}",
+                "view": "timeSeries", "stacked": false, "period": 300, "stat": "Sum",
+                "metrics": [
+                  ["ProbeWatch", "ProbeShapedAttempts", {"label": "Probe-shaped attempts"}],
+                  ["AWS/WAFV2", "CountedRequests", "WebACL", "${AWS::StackName}-edge", "Region", "${AWS::Region}", "Rule", "per-device-rate-limit", {"label": "WAF counted"}],
+                  ["AWS/WAFV2", "BlockedRequests", "WebACL", "${AWS::StackName}-edge", "Region", "${AWS::Region}", "Rule", "per-device-rate-limit", {"label": "WAF blocked"}]
+                ],
+                "annotations": {"horizontal": [{"value": 20, "label": "alarm threshold"}]}
+              }
+            }
+          ]
+        }
+
   # ---- The simulator: synthetic shoppers and synthetic card testers, aimed only
   #      at this stack's own API. It never takes a URL from its input.
   SimulateRole:
@@ -416,8 +490,20 @@ Outputs:
     Description: The checkout-wide alarm.
     Value: !Ref CheckoutWideAlarm
   PerDeviceQuery:
-    Description: Logs Insights. Attempts and distinct cards per device per 5-minute window.
-    Value: "filter ispresent(flow) | stats count(*) as attempts, count_distinct(card_fp) as cards by device_fp, bin(5m) | sort attempts desc | limit 20"
+    Description: Logs Insights. Attempts and distinct cards per device per 5-minute window. Also saved in the console.
+    Value: !FindInMap [Queries, PerDevice, Text]
   CheckoutWideQuery:
-    Description: Logs Insights. Probe-shaped attempts across the whole checkout per 5-minute window.
-    Value: 'filter ispresent(flow) and (flow = "save_card" or amount_minor <= 100) | stats count(*) as candidates, count_distinct(card_fp) as cards by bin(5m) | sort candidates desc | limit 20'
+    Description: Logs Insights. Probe-shaped attempts across the whole checkout per 5-minute window. Also saved in the console.
+    Value: !FindInMap [Queries, CheckoutWide, Text]
+  DashboardUrl:
+    Description: One page with both counts, the alarm and the WAF metrics. Set the time range to 1h.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}"
+  SimulatorTestUrl:
+    Description: Lambda console, Test tab. Event JSON {"scenario":"normal"}, then "loud", then "spread".
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/lambda/home?region=${AWS::Region}#/functions/${SimulateFunction}?tab=testing"
+  AlarmUrl:
+    Description: The checkout-wide alarm in the CloudWatch console.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#alarmsV2:alarm/${CheckoutWideAlarm}"
+  WebAclUrl:
+    Description: The WAF web ACL. Sampled requests show COUNT or BLOCK per request.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/wafv2/homev2/web-acl/${AWS::StackName}-edge/${WebAcl.Id}/overview?region=${AWS::Region}"
