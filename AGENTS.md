@@ -18,6 +18,10 @@ The lab does three things:
    (`bucket_epoch = floor(epoch/300)*300`), then cross-checks the Python results against
    Splunk SPL searches run inside a local Docker container.
 
+The `aws/` folder holds **Probe Watch**, the live AWS version of the same lab for the talk
+(API Gateway + WAF in front of a fake checkout on Lambda, detection in CloudWatch). It has
+its own `aws/AGENTS.md`; read it before touching anything there.
+
 Detectors (thresholds are hard-coded and must stay consistent across Python and SPL):
 
 - **D1 `device_rule`**: one device with ≥20 events and ≥15 distinct cards in a window.
@@ -45,6 +49,14 @@ docs/
 tools/
   sync_notebook.py        re-embeds card_testing_lab.py, requirements.txt and the SPL into
                           the notebook after edits (stdlib only; --check fails on drift)
+aws/
+  AGENTS.md               context and rules for the AWS lab; read first
+  probe-watch.yaml        one CloudFormation stack: API Gateway, WAF, two inline Lambdas,
+                          metric filter, alarm, SNS (cfn-lint clean, not yet deployed)
+  probe-watch-runbook.md  deploy, demo script, teardown, first-run notes
+  README.md               what the AWS lab shows and the three-step demo
+  scripts/                CloudShell helpers: deploy, demo, results, teardown (AWS CLI only)
+  tests/                  stdlib unittest for the inline handlers
 .lab-state/               gitignored; holds the container's bootstrap password (splunk.env)
 ```
 
@@ -82,6 +94,11 @@ Reset: `docker compose --env-file .lab-state/splunk.env -f splunk/compose.yaml d
 
 There is no conventional unit-test framework (no pytest). Correctness is enforced by
 self-checks and cross-implementation agreement:
+
+- `aws/`: `python3 -m unittest discover -s aws/tests` runs the handler tests (they read
+  the code out of `aws/probe-watch.yaml`, so there is one copy of it) and
+  `cfn-lint aws/probe-watch.yaml` must be clean. Rule thresholds there (20 attempts,
+  15 cards, 100 cents, 300 s) must match this lab's `card_testing_lab.py`.
 
 - `card_testing_lab.py` asserts generator reproducibility (regenerating from the same seed
   yields an identical DataFrame), unique event/card IDs, UTC timestamp round-trips, disjoint

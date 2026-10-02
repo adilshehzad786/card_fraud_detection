@@ -19,3 +19,8 @@ card_lab_requirements.txt
 .DS_Store
 .vscode/
 .idea/
+
+# AWS lab (aws/)
+aws/terraform/.terraform/
+*.tfstate
+*.tfstate.*

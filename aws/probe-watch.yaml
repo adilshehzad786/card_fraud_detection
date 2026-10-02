@@ -1,0 +1,423 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Probe Watch. A tiny fake checkout (API Gateway + Lambda) with AWS WAF in front,
+  used to show how card-testing attacks hide behind HTTP 200 and how counting per
+  device and across the whole checkout catches them. Synthetic data only: the API
+  accepts card fingerprints, never card numbers.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Alerting }
+        Parameters: [AlertEmail]
+      - Label: { default: Edge rate limit (AWS WAF) }
+        Parameters: [WafMode, RateLimitPerDevice]
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Receives the checkout-wide alarm. Confirm the subscription email after deploy.
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: must be an email address
+  WafMode:
+    Type: String
+    Default: COUNT
+    AllowedValues: [COUNT, BLOCK]
+    Description: COUNT only records when a device passes the limit. BLOCK answers 403 instead.
+  RateLimitPerDevice:
+    Type: Number
+    Default: 20
+    MinValue: 10
+    MaxValue: 2000000000
+    Description: Requests per 5 minutes from one x-device-fp header before the WAF rule acts.
+
+Conditions:
+  Blocking: !Equals [!Ref WafMode, BLOCK]
+
+Resources:
+  # ---- Logs. Both groups belong to the stack so deleting it leaves nothing behind.
+  CheckoutEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/probe-watch/${AWS::StackName}/checkout-events"
+      RetentionInDays: 3
+
+  SimulateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/probe-watch/${AWS::StackName}/simulate"
+      RetentionInDays: 3
+
+  # ---- The checkout: a fake shop and a fake payment provider in one function.
+  CheckoutRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-checkout-events
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt CheckoutEventsLogGroup.Arn
+
+  CheckoutFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-checkout"
+      Description: Fake checkout and payment provider. Prints one JSON business event per attempt.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CheckoutRole.Arn
+      MemorySize: 256
+      Timeout: 10
+      LoggingConfig:
+        # Text format: each print() lands as one raw JSON line, which the metric
+        # filter and Logs Insights field discovery both need.
+        LogFormat: Text
+        LogGroup: !Ref CheckoutEventsLogGroup
+      Code:
+        ZipFile: |
+          import datetime, hashlib, json
+
+          CODES = ["do_not_honor", "insufficient_funds", "invalid_card", "expired_card"]
+          JSON = {"content-type": "application/json"}
+
+
+          def bad(msg):
+              return {"statusCode": 400, "headers": JSON, "body": json.dumps({"error": msg})}
+
+
+          def handler(event, context):
+              # HTTP 200 means the API worked. Whether the card worked is in the
+              # response body and in the log line, never in the status code.
+              path = event.get("path") or event.get("resource") or ""
+              flow = "save_card" if path.endswith("/save-card") else "pay"
+              try:
+                  body = json.loads(event.get("body") or "{}")
+              except ValueError:
+                  return bad("body must be JSON")
+              if not isinstance(body, dict):
+                  return bad("body must be a JSON object")
+              card = str(body.get("card_fp") or "")
+              if not card:
+                  return bad("card_fp is required")
+              digits = card.replace(" ", "")
+              if digits.isdigit() and len(digits) >= 12:
+                  return bad("card_fp must be a fingerprint, never a card number")
+              headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+              device = str(body.get("device_fp") or headers.get("x-device-fp") or "unknown")
+              amount = 0
+              if flow == "pay":
+                  amount = body.get("amount_minor")
+                  if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+                      return bad("amount_minor must be a whole number of cents, 0 or more")
+              # Fake provider: a card's fate is fixed by its fingerprint, like a real
+              # card that is either live or dead. Test cards (ct_) approve 35%, others 96%.
+              h = int.from_bytes(hashlib.sha256(card.encode()).digest()[:4], "big")
+              approved = h % 100 < (35 if card.startswith("ct_") else 96)
+              rc = event.get("requestContext") or {}
+              now = datetime.datetime.now(datetime.timezone.utc)
+              evt = {
+                  "ts": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                  "flow": flow,
+                  "outcome": "approved" if approved else "declined",
+                  "decline_code": None if approved else CODES[h // 100 % 4],
+                  "device_fp": device,
+                  "card_fp": card,
+                  "bin": str(body.get("bin") or "")[:6],
+                  "amount_minor": amount,
+                  "currency": str(body.get("currency") or "USD").upper()[:3],
+                  "request_id": rc.get("requestId"),
+                  "source_ip": (rc.get("identity") or {}).get("sourceIp"),
+              }
+              print(json.dumps(evt, separators=(",", ":")))  # one business event per attempt
+              reply = {k: evt[k] for k in ("outcome", "decline_code", "request_id")}
+              return {"statusCode": 200, "headers": JSON, "body": json.dumps(reply)}
+
+  # ---- API Gateway REST API, regional, one stage, two POST routes.
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-checkout"
+      Description: Probe Watch fake checkout. POST /pay and POST /save-card.
+      EndpointConfiguration: { Types: [REGIONAL] }
+
+  PayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: pay
+
+  SaveCardResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: save-card
+
+  PayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref PayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CheckoutFunction.Arn}/invocations"
+
+  SaveCardMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref SaveCardResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CheckoutFunction.Arn}/invocations"
+
+  # A deployment snapshots the methods, so it must be created after them. If you
+  # change a method later, rename this resource (ApiDeployment2) to force a new one.
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [PayMethod, SaveCardMethod]
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: Probe Watch demo deployment
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: demo
+      Description: The only stage. The WAF web ACL is attached here.
+
+  CheckoutInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CheckoutFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/*"
+
+  # ---- Edge: one rate-based rule keyed on the device fingerprint header.
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${AWS::StackName}-edge"
+      Scope: REGIONAL
+      Description: Counts or blocks a device that sends too many checkout requests in 5 minutes.
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-edge"
+      Rules:
+        - Name: per-device-rate-limit
+          Priority: 0
+          Action: !If [Blocking, { Block: {} }, { Count: {} }]
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPerDevice
+              EvaluationWindowSec: 300
+              AggregateKeyType: CUSTOM_KEYS
+              CustomKeys:
+                - Header:
+                    Name: x-device-fp
+                    TextTransformations:
+                      - Priority: 0
+                        Type: NONE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: per-device-rate-limit
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      # REST API stage ARN format: arn:partition:apigateway:region::/restapis/<id>/stages/<name>
+      ResourceArn: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${RestApi}/stages/${ApiStage}"
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  # ---- Detection: the checkout-wide rule as a metric filter and an alarm.
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      DisplayName: Probe Watch
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  ProbeShapedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CheckoutEventsLogGroup
+      FilterName: probe-shaped-attempts
+      # A "probe-shaped" attempt is a card save or a payment of 100 cents or less.
+      FilterPattern: '{ ($.flow = "save_card") || ($.amount_minor <= 100) }'
+      MetricTransformations:
+        - MetricNamespace: ProbeWatch
+          MetricName: ProbeShapedAttempts
+          MetricValue: "1"
+          DefaultValue: 0
+          Unit: Count
+
+  CheckoutWideAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-checkout-wide-probes"
+      AlarmDescription: >-
+        More than 20 probe-shaped attempts (card saves, or payments of 100 cents or
+        less) across the whole checkout in one 5-minute window. Investigate; do not
+        auto-block.
+      Namespace: ProbeWatch
+      MetricName: ProbeShapedAttempts
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # ---- The simulator: synthetic shoppers and synthetic card testers, aimed only
+  #      at this stack's own API. It never takes a URL from its input.
+  SimulateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-own-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt SimulateLogGroup.Arn
+
+  SimulateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-simulate"
+      Description: Sends synthetic shopper and card-testing traffic to this stack's own API and returns a status-code histogram.
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SimulateRole.Arn
+      MemorySize: 256
+      Timeout: 600
+      Environment:
+        Variables:
+          API_URL: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref SimulateLogGroup
+      Code:
+        ZipFile: |
+          import hashlib, json, os, random, time, urllib.error, urllib.request
+          from urllib.parse import urlparse
+
+          # The only URL this code will ever call: this stack's own API, set by CloudFormation.
+          API = os.environ["API_URL"].rstrip("/")
+          BINS = ["411111", "424242", "510510", "555555", "601100"]
+          # scenario -> (attempts, seconds to wait between requests)
+          PLAN = {"normal": (60, 0.05), "loud": (120, 0.1), "spread": (360, 0.2)}
+
+
+          def post(flow, device, card, amount, bin6):
+              body = {"card_fp": card, "device_fp": device, "bin": bin6, "currency": "USD"}
+              if flow == "pay":
+                  body["amount_minor"] = amount
+              req = urllib.request.Request(
+                  API + ("/save-card" if flow == "save_card" else "/pay"),
+                  data=json.dumps(body).encode(), method="POST",
+                  headers={"content-type": "application/json", "x-device-fp": device})
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      return r.status, json.loads(r.read() or b"{}").get("outcome")
+              except urllib.error.HTTPError as e:  # a WAF block (403) lands here
+                  return e.code, None
+              except urllib.error.URLError:
+                  return 0, None
+
+
+          def handler(event, context):
+              host = urlparse(API).netloc
+              if ".execute-api." not in host or not host.endswith(".amazonaws.com"):
+                  raise RuntimeError("refusing to run: API_URL is not an API Gateway URL")
+              event = event or {}
+              scenario = event.get("scenario", "normal")
+              if scenario not in PLAN:
+                  raise ValueError("scenario must be normal, loud or spread")
+              n, pace = PLAN[scenario]
+              n = max(1, min(int(event.get("n") or n), 600))  # sandbox: hundreds, not thousands
+              pace = float(event.get("pace", pace))
+              seed = int(event.get("seed") or time.time())
+              rng = random.Random(seed)
+              tag = hashlib.sha256(str(seed).encode()).hexdigest()[:6]  # fresh fingerprints each run
+              status, outcomes, t0 = {}, {}, time.time()
+              for i in range(n):
+                  if scenario == "normal":
+                      # One shopper, one attempt: own device, own card, a normal basket.
+                      device, card = f"shop_dev_{tag}_{i}", f"card_{tag}_{i}"
+                      flow = "save_card" if rng.random() < 0.1 else "pay"
+                      amount = rng.randint(1200, 18000)
+                  else:
+                      # One probe: a fresh stolen card, a tiny payment or a free card save.
+                      # loud = one device for everything; spread = 80 devices, 4-5 attempts each.
+                      device = "ct_loud_dev_1" if scenario == "loud" else f"ct_spread_dev_{i % 80 + 1}"
+                      card = f"ct_card_{tag}_{i}"
+                      flow = "save_card" if rng.random() < 0.3 else "pay"
+                      amount = rng.choice([50, 99, 100])
+                  code, outcome = post(flow, device, card, amount, rng.choice(BINS))
+                  status[str(code)] = status.get(str(code), 0) + 1
+                  if outcome:
+                      outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                  if pace:
+                      time.sleep(pace)
+              return {"scenario": scenario, "sent": n, "seed": seed, "status": status,
+                      "outcomes": outcomes, "elapsed_s": round(time.time() - t0, 1), "api": API}
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the fake checkout (POST /pay, POST /save-card).
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
+  EventsLogGroup:
+    Description: Log group holding one JSON business event per attempt.
+    Value: !Ref CheckoutEventsLogGroup
+  SimulatorFunction:
+    Description: Invoke with {"scenario":"normal"|"loud"|"spread"}.
+    Value: !Ref SimulateFunction
+  WafMode:
+    Description: Current action of the per-device rate rule.
+    Value: !Ref WafMode
+  AlarmName:
+    Description: The checkout-wide alarm.
+    Value: !Ref CheckoutWideAlarm
+  PerDeviceQuery:
+    Description: Logs Insights. Attempts and distinct cards per device per 5-minute window.
+    Value: "filter ispresent(flow) | stats count(*) as attempts, count_distinct(card_fp) as cards by device_fp, bin(5m) | sort attempts desc | limit 20"
+  CheckoutWideQuery:
+    Description: Logs Insights. Probe-shaped attempts across the whole checkout per 5-minute window.
+    Value: 'filter ispresent(flow) and (flow = "save_card" or amount_minor <= 100) | stats count(*) as candidates, count_distinct(card_fp) as cards by bin(5m) | sort candidates desc | limit 20'
