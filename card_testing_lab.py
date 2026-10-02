@@ -232,7 +232,7 @@ def summarize(df):
 
 def draw_chart(path, summary, classic):
     plt.rcParams.update({"font.family": "DejaVu Sans", "text.color": "#F5F4FF"})
-    bg, panel, purple, green, red = "#1a1a2e", "#25253e", "#6C5CE7", "#00B894", "#D63031"
+    bg, panel, green = "#1a1a2e", "#25253e", "#00B894"
     fig = plt.figure(figsize=(10.8, 13.5), dpi=100, facecolor=bg)
     ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 1080); ax.set_ylim(1350, 0); ax.axis("off")
     ax.text(64, 76, "CHECKOUT SECURITY  /  SYNTHETIC LAB", fontsize=14, weight="bold", color="#ABA2FF")
@@ -299,15 +299,20 @@ def main():
     events = apply_detectors(events, model, threshold)
     reference_rule_flags(events)
     summary = summarize(events)
-    csv_text = events.to_csv(index=False, float_format="%.10f")
-    (out / "card_testing_events.csv").write_text(csv_text)
-    summary.to_csv(out / "card_testing_metrics.csv", index=False, float_format="%.10f")
-    splits.to_csv(out / "classic_split_manifest.csv", index=False)
+    csv_text = events.to_csv(index=False, float_format="%.10f", lineterminator="\n")
+    # Write the exact bytes fingerprinted below, independent of host newline conventions.
+    (out / "card_testing_events.csv").write_bytes(csv_text.encode("utf-8"))
+    summary.to_csv(out / "card_testing_metrics.csv", index=False, float_format="%.10f",
+                   lineterminator="\n", encoding="utf-8")
+    splits.to_csv(out / "classic_split_manifest.csv", index=False, lineterminator="\n", encoding="utf-8")
     metrics = build_metrics(args, events, csv_text, classic, summary)
-    (out / "card_testing_metrics.json").write_text(json.dumps(metrics, indent=2, allow_nan=False) + "\n")
+    (out / "card_testing_metrics.json").write_bytes((json.dumps(metrics, indent=2, allow_nan=False) + "\n").encode("utf-8"))
     # The official chart is for the default 80-device baseline. Avoid mislabeling a variant.
+    chart_path = out / "card_testing_chart.png"
     if args.spread_devices == 80:
-        draw_chart(out / "card_testing_chart.png", summary, classic)
+        draw_chart(chart_path, summary, classic)
+    else:
+        chart_path.unlink(missing_ok=True)
     print(json.dumps({k: metrics[k] for k in ["seed", "event_count", "event_sha256", "classic_test", "benign_false_positives"]}, indent=2))
     print(summary[["scenario", "detector", "events", "flagged_events", "coverage"]].to_string(index=False))
     print(f"Saved verified outputs to: {out.resolve()}")
